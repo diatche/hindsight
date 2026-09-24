@@ -869,8 +869,11 @@ class DaemonEmbedManager(EmbedManager):
         env["HINDSIGHT_API_DAEMON_LOG"] = str(daemon_log)
 
         # Build command
+        # The manager already detaches this child with start_new_session and
+        # redirects its stdio. Asking hindsight-api to daemonize again adds a
+        # fork-without-exec step; on macOS, native libraries initialized before
+        # that fork can leave the child deadlocked during application imports.
         cmd = self._find_api_command(self._component_version(profile, "HINDSIGHT_EMBED_API_VERSION"), env=env) + [
-            "--daemon",
             "--idle-timeout",
             str(idle_timeout),
             "--port",

@@ -33,9 +33,12 @@ def test_start_timeout_terminates_spawned_daemon(tmp_path, monkeypatch):
     paths = SimpleNamespace(log=tmp_path / "daemon.log", port=9177)
     monkeypatch.setattr("hindsight_embed.daemon_embed_manager.DAEMON_STARTUP_TIMEOUT", 0)
 
-    with patch("hindsight_embed.daemon_embed_manager.subprocess.Popen", return_value=process):
+    with patch("hindsight_embed.daemon_embed_manager.subprocess.Popen", return_value=process) as popen:
         assert manager._start_daemon_locked({}, "test", paths) is False
 
+    command = popen.call_args.args[0]
+    assert command == ["hindsight-api", "--idle-timeout", "0", "--port", "9177"]
+    assert "--daemon" not in command
     process.terminate.assert_called_once_with()
     process.wait.assert_called_once_with(timeout=10)
 
