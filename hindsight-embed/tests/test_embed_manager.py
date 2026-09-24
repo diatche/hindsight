@@ -2,15 +2,54 @@
 
 import io
 import subprocess
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from hindsight_embed import get_embed_manager
 from hindsight_embed._http_probe import ProbeResponse
-from hindsight_embed.daemon_embed_manager import DaemonEmbedManager, _detach_popen_kwargs
+from hindsight_embed.daemon_embed_manager import (
+    DaemonEmbedManager,
+    _detach_popen_kwargs,
+    _terminate_startup_process,
+)
 
 
 def _mock_sentence_transformers_present(monkeypatch):
     monkeypatch.setattr("hindsight_embed.daemon_embed_manager.find_spec", lambda name: object())
+
+
+def test_start_timeout_terminates_spawned_daemon(tmp_path, monkeypatch):
+    manager = DaemonEmbedManager()
+    manager._profile_manager = MagicMock()
+    manager._profile_manager.load_profile_config.return_value = {}
+    manager._clear_port = MagicMock(return_value=True)
+    manager.is_running = MagicMock(return_value=False)
+    manager._component_version = MagicMock(return_value="0.0.0")
+    manager._find_api_command = MagicMock(return_value=["hindsight-api"])
+
+    process = MagicMock()
+    process.poll.return_value = None
+    process.wait.return_value = 0
+    paths = SimpleNamespace(log=tmp_path / "daemon.log", port=9177)
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.DAEMON_STARTUP_TIMEOUT", 0)
+
+    with patch("hindsight_embed.daemon_embed_manager.subprocess.Popen", return_value=process):
+        assert manager._start_daemon_locked({}, "test", paths) is False
+
+    process.terminate.assert_called_once_with()
+    process.wait.assert_called_once_with(timeout=10)
+
+
+def test_start_timeout_kills_daemon_that_ignores_terminate():
+    process = MagicMock()
+    process.poll.return_value = None
+    process.wait.side_effect = [subprocess.TimeoutExpired("hindsight-api", 10), 0]
+
+    _terminate_startup_process(process)
+
+    process.terminate.assert_called_once_with()
+    process.kill.assert_called_once_with()
+    assert process.wait.call_count == 2
 
 
 def test_sanitize_profile_name_via_db_url():

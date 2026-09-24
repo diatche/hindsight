@@ -69,6 +69,7 @@ def _parse_non_negative_int(value: str | None, default: int, name: str) -> int:
 # unpacks and runs initdb on first boot, which takes noticeably longer on cold
 # runners than POSIX.
 DAEMON_STARTUP_TIMEOUT = int(os.getenv("HINDSIGHT_EMBED_DAEMON_STARTUP_TIMEOUT", "180"))
+DAEMON_STARTUP_TERMINATE_TIMEOUT = 10
 DEFAULT_DAEMON_IDLE_TIMEOUT = 0  # 0 = disabled (no auto-exit)
 ENV_DAEMON_LOG_MAX_BYTES = "HINDSIGHT_EMBED_DAEMON_LOG_MAX_BYTES"
 ENV_DAEMON_LOG_BACKUP_COUNT = "HINDSIGHT_EMBED_DAEMON_LOG_BACKUP_COUNT"
@@ -177,6 +178,21 @@ def _detach_popen_kwargs(log_handle: IO[bytes]) -> dict:
         "stdout": log_handle,
         "stderr": log_handle,
     }
+
+
+def _terminate_startup_process(process: subprocess.Popen) -> None:
+    """Stop the exact daemon child owned by a failed startup attempt."""
+    if process.poll() is not None:
+        return
+    try:
+        process.terminate()
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=DAEMON_STARTUP_TERMINATE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=DAEMON_STARTUP_TERMINATE_TIMEOUT)
 
 
 @dataclass(frozen=True)
@@ -872,7 +888,7 @@ class DaemonEmbedManager(EmbedManager):
             # Popen dups the fd into the child during spawn, so the parent
             # can close its handle as soon as Popen returns.
             with open(daemon_log, "ab") as daemon_log_handle:
-                subprocess.Popen(cmd, env=env, **_detach_popen_kwargs(daemon_log_handle))
+                daemon_process = subprocess.Popen(cmd, env=env, **_detach_popen_kwargs(daemon_log_handle))
 
             # Wait for daemon to be ready with rich UI
             start_time = time.time()
@@ -972,6 +988,11 @@ class DaemonEmbedManager(EmbedManager):
             panel = Panel(content, title=timeout_title, border_style="red", padding=(1, 2))
             console.print(panel)
             console.print()
+            # Before this cleanup, the manager returned after 180s but left the
+            # detached child initializing for up to the API's own 300s timeout.
+            # A supervisor retry could then accumulate overlapping daemons that
+            # had not bound the port yet, so port-based cleanup could not see them.
+            _terminate_startup_process(daemon_process)
             return False
 
         except FileNotFoundError:
