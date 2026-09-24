@@ -40,6 +40,27 @@ def test_start_timeout_terminates_spawned_daemon(tmp_path, monkeypatch):
     process.wait.assert_called_once_with(timeout=10)
 
 
+def test_startup_keeps_polling_after_transient_stability_failure(tmp_path, monkeypatch):
+    manager = DaemonEmbedManager()
+    manager._profile_manager = MagicMock()
+    manager._profile_manager.load_profile_config.return_value = {}
+    manager._clear_port = MagicMock(return_value=True)
+    manager.is_running = MagicMock(side_effect=[False, True, False, True, True])
+    manager._component_version = MagicMock(return_value="0.0.0")
+    manager._find_api_command = MagicMock(return_value=["hindsight-api"])
+
+    process = MagicMock()
+    paths = SimpleNamespace(log=tmp_path / "daemon.log", port=9177)
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.time.sleep", lambda _seconds: None)
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.time.time", MagicMock(side_effect=[0, 0, 0, 1]))
+
+    with patch("hindsight_embed.daemon_embed_manager.subprocess.Popen", return_value=process):
+        assert manager._start_daemon_locked({}, "test", paths) is True
+
+    process.terminate.assert_not_called()
+    assert manager.is_running.call_count == 5
+
+
 def test_start_timeout_kills_daemon_that_ignores_terminate():
     process = MagicMock()
     process.poll.return_value = None

@@ -953,14 +953,16 @@ class DaemonEmbedManager(EmbedManager):
                             return True
                         else:
                             log_lines.append("")
-                            log_lines.append("✗ Daemon crashed during initialization")
+                            log_lines.append("Health probe failed after readiness; continuing to wait...")
                             content = Text("\n".join(log_lines), style="dim")
-                            fail_title = f"[bold red]✗ Daemon Failed[/bold red] [dim]({profile} @ :{port})[/dim]"
-                            panel = Panel(content, title=fail_title, border_style="red", padding=(1, 2))
+                            panel = Panel(content, title=title, border_style="cyan", padding=(1, 2))
                             live.update(panel)
                             live.refresh()
-                            console.print()
-                            break
+                            # /health shares the daemon event loop with startup
+                            # backlog processing. A single missed stability probe
+                            # is not evidence that the process exited; keep polling
+                            # within the existing startup deadline.
+                            continue
 
                     # Periodic progress
                     if time.time() - last_check_time > 3:
