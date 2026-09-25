@@ -1,6 +1,7 @@
 """Tests for EmbedManager interface."""
 
 import io
+import signal
 import subprocess
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -18,62 +19,89 @@ def _mock_sentence_transformers_present(monkeypatch):
     monkeypatch.setattr("hindsight_embed.daemon_embed_manager.find_spec", lambda name: object())
 
 
-def test_start_timeout_terminates_spawned_daemon(tmp_path, monkeypatch):
+def _startup_manager(is_running: MagicMock) -> DaemonEmbedManager:
     manager = DaemonEmbedManager()
     manager._profile_manager = MagicMock()
     manager._profile_manager.load_profile_config.return_value = {}
     manager._clear_port = MagicMock(return_value=True)
-    manager.is_running = MagicMock(return_value=False)
+    manager.is_running = is_running
     manager._component_version = MagicMock(return_value="0.0.0")
     manager._find_api_command = MagicMock(return_value=["hindsight-api"])
+    return manager
 
-    process = MagicMock()
+
+def _running_process() -> MagicMock:
+    process = MagicMock(pid=4321)
     process.poll.return_value = None
     process.wait.return_value = 0
+    return process
+
+
+def test_start_timeout_terminates_spawned_daemon_group(tmp_path, monkeypatch):
+    manager = _startup_manager(MagicMock(return_value=False))
+    process = _running_process()
     paths = SimpleNamespace(log=tmp_path / "daemon.log", port=9177)
     monkeypatch.setattr("hindsight_embed.daemon_embed_manager.DAEMON_STARTUP_TIMEOUT", 0)
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.platform.system", lambda: "Linux")
+    killpg = MagicMock()
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.os.killpg", killpg)
 
     with patch("hindsight_embed.daemon_embed_manager.subprocess.Popen", return_value=process) as popen:
         assert manager._start_daemon_locked({}, "test", paths) is False
 
-    command = popen.call_args.args[0]
-    assert command == ["hindsight-api", "--idle-timeout", "0", "--port", "9177"]
-    assert "--daemon" not in command
-    process.terminate.assert_called_once_with()
+    assert popen.call_args.args[0] == ["hindsight-api", "--idle-timeout", "0", "--port", "9177"]
+    # The whole group, so a uvx launcher's hindsight-api grandchild goes too.
+    killpg.assert_called_once_with(4321, signal.SIGTERM)
     process.wait.assert_called_once_with(timeout=10)
 
 
 def test_startup_keeps_polling_after_transient_stability_failure(tmp_path, monkeypatch):
-    manager = DaemonEmbedManager()
-    manager._profile_manager = MagicMock()
-    manager._profile_manager.load_profile_config.return_value = {}
-    manager._clear_port = MagicMock(return_value=True)
-    manager.is_running = MagicMock(side_effect=[False, True, False, True, True])
-    manager._component_version = MagicMock(return_value="0.0.0")
-    manager._find_api_command = MagicMock(return_value=["hindsight-api"])
-
-    process = MagicMock()
+    manager = _startup_manager(MagicMock(side_effect=[False, True, False, True, True]))
+    process = _running_process()
     paths = SimpleNamespace(log=tmp_path / "daemon.log", port=9177)
     monkeypatch.setattr("hindsight_embed.daemon_embed_manager.time.sleep", lambda _seconds: None)
-    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.time.time", MagicMock(side_effect=[0, 0, 0, 1]))
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.time.time", lambda: 0)
 
     with patch("hindsight_embed.daemon_embed_manager.subprocess.Popen", return_value=process):
         assert manager._start_daemon_locked({}, "test", paths) is True
 
-    process.terminate.assert_not_called()
+    process.wait.assert_not_called()
     assert manager.is_running.call_count == 5
 
 
-def test_start_timeout_kills_daemon_that_ignores_terminate():
-    process = MagicMock()
-    process.poll.return_value = None
+def test_startup_fails_fast_when_daemon_exits(tmp_path, monkeypatch):
+    manager = _startup_manager(MagicMock(return_value=False))
+    process = _running_process()
+    process.poll.return_value = 1
+    paths = SimpleNamespace(log=tmp_path / "daemon.log", port=9177)
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.time.sleep", MagicMock(side_effect=AssertionError))
+
+    with patch("hindsight_embed.daemon_embed_manager.subprocess.Popen", return_value=process):
+        assert manager._start_daemon_locked({}, "test", paths) is False
+
+    manager.is_running.assert_called_once()  # the pre-spawn check only
+
+
+def test_start_timeout_kills_daemon_group_that_ignores_terminate(monkeypatch):
+    process = _running_process()
     process.wait.side_effect = [subprocess.TimeoutExpired("hindsight-api", 10), 0]
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.platform.system", lambda: "Linux")
+    killpg = MagicMock()
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.os.killpg", killpg)
 
     _terminate_startup_process(process)
 
-    process.terminate.assert_called_once_with()
-    process.kill.assert_called_once_with()
+    assert killpg.call_args_list == [((4321, signal.SIGTERM),), ((4321, signal.SIGKILL),)]
     assert process.wait.call_count == 2
+
+
+def test_start_timeout_kills_daemon_on_windows(monkeypatch):
+    process = _running_process()
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.platform.system", lambda: "Windows")
+
+    _terminate_startup_process(process)
+
+    process.kill.assert_called_once_with()
 
 
 def test_sanitize_profile_name_via_db_url():

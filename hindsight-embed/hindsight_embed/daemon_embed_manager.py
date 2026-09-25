@@ -10,6 +10,7 @@ import math
 import os
 import platform
 import re
+import signal
 import subprocess
 import sys
 import sysconfig
@@ -180,19 +181,34 @@ def _detach_popen_kwargs(log_handle: IO[bytes]) -> dict:
     }
 
 
+def _signal_startup_process(process: subprocess.Popen, *, force: bool) -> None:
+    """Signal the daemon child's whole process group on POSIX.
+
+    The child may be the ``uvx`` launcher rather than hindsight-api itself;
+    signalling only its pid can leave the real API running as an orphan.
+    ``_detach_popen_kwargs`` starts it with ``start_new_session``, so its pid is
+    also its process group id. On Windows there is no group to signal, and
+    ``terminate()`` is already an alias for ``kill()``.
+    """
+    if platform.system() == "Windows":
+        process.kill()
+    else:
+        os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
+
+
 def _terminate_startup_process(process: subprocess.Popen) -> None:
-    """Stop the exact daemon child owned by a failed startup attempt."""
+    """Stop the daemon child owned by a failed startup attempt, escalating to kill."""
     if process.poll() is not None:
         return
     try:
-        process.terminate()
+        _signal_startup_process(process, force=False)
+        try:
+            process.wait(timeout=DAEMON_STARTUP_TERMINATE_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            _signal_startup_process(process, force=True)
+            process.wait(timeout=DAEMON_STARTUP_TERMINATE_TIMEOUT)
     except ProcessLookupError:
         return
-    try:
-        process.wait(timeout=DAEMON_STARTUP_TERMINATE_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait(timeout=DAEMON_STARTUP_TERMINATE_TIMEOUT)
 
 
 @dataclass(frozen=True)
@@ -869,10 +885,11 @@ class DaemonEmbedManager(EmbedManager):
         env["HINDSIGHT_API_DAEMON_LOG"] = str(daemon_log)
 
         # Build command
-        # The manager already detaches this child with start_new_session and
-        # redirects its stdio. Asking hindsight-api to daemonize again adds a
-        # fork-without-exec step; on macOS, native libraries initialized before
-        # that fork can leave the child deadlocked during application imports.
+        # No --daemon: _HINDSIGHT_DAEMON_CHILD above already puts hindsight-api
+        # in daemon mode, and this Popen already detaches it. Passing --daemon
+        # too was redundant, and API versions older than the Popen-based
+        # daemonize() (#1519) fork on it, which can deadlock native libraries
+        # on macOS.
         cmd = self._find_api_command(self._component_version(profile, "HINDSIGHT_EMBED_API_VERSION"), env=env) + [
             "--idle-timeout",
             str(idle_timeout),
@@ -908,6 +925,22 @@ class DaemonEmbedManager(EmbedManager):
                 live.refresh()
 
                 while time.time() - start_time < DAEMON_STARTUP_TIMEOUT:
+                    # Polling keeps going through a missed health probe (below),
+                    # so a child that actually died is detected here instead of
+                    # waiting out the whole startup deadline.
+                    exit_code = daemon_process.poll()
+                    if exit_code is not None:
+                        log_lines.append("")
+                        log_lines.append(f"✗ Daemon exited during initialization (exit code {exit_code})")
+                        log_lines.append(f"See full log: {daemon_log}")
+                        content = Text("\n".join(log_lines), style="dim")
+                        fail_title = f"[bold red]✗ Daemon Failed[/bold red] [dim]({profile} @ :{port})[/dim]"
+                        panel = Panel(content, title=fail_title, border_style="red", padding=(1, 2))
+                        live.update(panel)
+                        live.refresh()
+                        console.print()
+                        return False
+
                     # Tail daemon logs
                     if daemon_log.exists():
                         try:
@@ -993,10 +1026,10 @@ class DaemonEmbedManager(EmbedManager):
             panel = Panel(content, title=timeout_title, border_style="red", padding=(1, 2))
             console.print(panel)
             console.print()
-            # Before this cleanup, the manager returned after 180s but left the
-            # detached child initializing for up to the API's own 300s timeout.
-            # A supervisor retry could then accumulate overlapping daemons that
-            # had not bound the port yet, so port-based cleanup could not see them.
+            # Before this cleanup, the manager returned at the deadline but left
+            # the detached child initializing. A supervisor retry could then
+            # accumulate overlapping daemons that had not bound the port yet, so
+            # port-based cleanup could not see them.
             _terminate_startup_process(daemon_process)
             return False
 
