@@ -3,8 +3,11 @@
 import io
 import signal
 import subprocess
+import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from hindsight_embed import get_embed_manager
 from hindsight_embed._http_probe import ProbeResponse
@@ -17,6 +20,10 @@ from hindsight_embed.daemon_embed_manager import (
 
 def _mock_sentence_transformers_present(monkeypatch):
     monkeypatch.setattr("hindsight_embed.daemon_embed_manager.find_spec", lambda name: object())
+
+
+# Process groups and SIGKILL do not exist on Windows.
+_posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
 
 
 def _startup_manager(is_running: MagicMock) -> DaemonEmbedManager:
@@ -37,6 +44,7 @@ def _running_process() -> MagicMock:
     return process
 
 
+@_posix_only
 def test_start_timeout_terminates_spawned_daemon_group(tmp_path, monkeypatch):
     manager = _startup_manager(MagicMock(return_value=False))
     process = _running_process()
@@ -44,7 +52,7 @@ def test_start_timeout_terminates_spawned_daemon_group(tmp_path, monkeypatch):
     monkeypatch.setattr("hindsight_embed.daemon_embed_manager.DAEMON_STARTUP_TIMEOUT", 0)
     monkeypatch.setattr("hindsight_embed.daemon_embed_manager.platform.system", lambda: "Linux")
     killpg = MagicMock()
-    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.os.killpg", killpg, raising=False)  # absent on Windows
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.os.killpg", killpg)
 
     with patch("hindsight_embed.daemon_embed_manager.subprocess.Popen", return_value=process) as popen:
         assert manager._start_daemon_locked({}, "test", paths) is False
@@ -82,12 +90,13 @@ def test_startup_fails_fast_when_daemon_exits(tmp_path, monkeypatch):
     manager.is_running.assert_called_once()  # the pre-spawn check only
 
 
+@_posix_only
 def test_start_timeout_kills_daemon_group_that_ignores_terminate(monkeypatch):
     process = _running_process()
     process.wait.side_effect = [subprocess.TimeoutExpired("hindsight-api", 10), 0]
     monkeypatch.setattr("hindsight_embed.daemon_embed_manager.platform.system", lambda: "Linux")
     killpg = MagicMock()
-    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.os.killpg", killpg, raising=False)  # absent on Windows
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.os.killpg", killpg)
 
     _terminate_startup_process(process)
 
