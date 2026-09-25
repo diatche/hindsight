@@ -44,7 +44,7 @@ def test_start_timeout_terminates_spawned_daemon_group(tmp_path, monkeypatch):
     monkeypatch.setattr("hindsight_embed.daemon_embed_manager.DAEMON_STARTUP_TIMEOUT", 0)
     monkeypatch.setattr("hindsight_embed.daemon_embed_manager.platform.system", lambda: "Linux")
     killpg = MagicMock()
-    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.os.killpg", killpg)
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.os.killpg", killpg, raising=False)  # absent on Windows
 
     with patch("hindsight_embed.daemon_embed_manager.subprocess.Popen", return_value=process) as popen:
         assert manager._start_daemon_locked({}, "test", paths) is False
@@ -87,7 +87,7 @@ def test_start_timeout_kills_daemon_group_that_ignores_terminate(monkeypatch):
     process.wait.side_effect = [subprocess.TimeoutExpired("hindsight-api", 10), 0]
     monkeypatch.setattr("hindsight_embed.daemon_embed_manager.platform.system", lambda: "Linux")
     killpg = MagicMock()
-    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.os.killpg", killpg)
+    monkeypatch.setattr("hindsight_embed.daemon_embed_manager.os.killpg", killpg, raising=False)  # absent on Windows
 
     _terminate_startup_process(process)
 
